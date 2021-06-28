@@ -9,7 +9,7 @@ const debug = _debug("aws-azure-login");
 
 const writeFile = util.promisify(fs.writeFile);
 
-// Autorefresh credential time limit in milliseconds
+// Auto-refresh credential time limit in milliseconds
 const refreshLimitInMs = 11 * 60 * 1000;
 
 export interface ProfileConfig {
@@ -21,6 +21,8 @@ export interface ProfileConfig {
   azure_default_duration_hours: string;
   region?: string;
   azure_default_remember_me: boolean;
+  adfs_prompt_expected?: boolean;
+  adfs_username?: string;
   [key: string]: unknown;
 }
 

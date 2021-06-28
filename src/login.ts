@@ -20,7 +20,7 @@ const debug = _debug("aws-azure-login");
 const WIDTH = 425;
 const HEIGHT = 550;
 const DELAY_ON_UNRECOGNIZED_PAGE = 1000;
-const MAX_UNRECOGNIZED_PAGE_DELAY = 30 * 1000;
+const MAX_UNRECOGNIZED_PAGE_DELAY = 10 * 1000;
 
 // source: https://docs.microsoft.com/en-us/azure/active-directory/hybrid/how-to-connect-sso-quick-start#google-chrome-all-platforms
 const AZURE_AD_SSO = "autologon.microsoftazuread-sso.com";
@@ -32,6 +32,19 @@ interface Role {
   roleArn: string;
   principalArn: string;
 }
+
+// Toggle if ADFS is part of the SSO process.
+let ADFS_PROMPT_EXPECTED: boolean;
+
+/**
+ * ADFS systems' USERNAME field can be different to the Azure AD USERNAME field.
+ * USERNAME = `foo.bar@acme.com`
+ * ADFS_USERNAME = `foo_bar`
+ */
+let ADFS_USERNAME: string;
+
+let USERNAME: string;
+let PASSWORD: string;
 
 /**
  * To proxy the input/output of the Azure login page, it's easiest to run a loop that
@@ -48,7 +61,8 @@ const states = [
       page: puppeteer.Page,
       _selected: puppeteer.ElementHandle,
       noPrompt: boolean,
-      defaultUsername: string
+      defaultUsername: string,
+      defaultPassword: string
     ): Promise<void> {
       const error = await page.$(".alert-error");
       if (error) {
@@ -62,8 +76,7 @@ const states = [
         console.log(errorMessage);
       }
 
-      let username;
-
+      let username: string;
       if (noPrompt && defaultUsername) {
         debug("Not prompting user for username");
         username = defaultUsername;
@@ -76,6 +89,35 @@ const states = [
             default: defaultUsername,
           } as Question,
         ]));
+      }
+      // Export locally
+      USERNAME = username;
+
+      if (ADFS_PROMPT_EXPECTED) {
+        /**
+         * Get password from stdin, if ADFS_PROMPT_EXPECTED and defaultPassword is unset.
+         * The user will never enter the `password input` state so it must be set here.
+         */
+        if (noPrompt && defaultPassword) {
+          debug("Not prompting user for password");
+          // Export locally
+          PASSWORD = defaultPassword;
+        } else {
+          debug("Prompting user for password");
+          const p = await inquirer.prompt([
+            {
+              name: "password",
+              message: "Password:",
+              type: "password",
+              default: defaultPassword,
+            } as Question,
+          ]);
+          // Export locally
+          PASSWORD = p.password as string;
+        }
+      } else {
+        // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
+        debug(`expecting_adfs_prompt: ${ADFS_PROMPT_EXPECTED}`);
       }
 
       debug("Waiting for username input to be visible");
@@ -205,8 +247,7 @@ const states = [
         defaultPassword = ""; // Password error. Unset the default and allow user to enter it.
       }
 
-      let password;
-
+      let password: string;
       if (noPrompt && defaultPassword) {
         debug("Not prompting user for password");
         password = defaultPassword;
@@ -373,6 +414,43 @@ const states = [
       throw new CLIError(descriptionMessage);
     },
   },
+  {
+    name: "Chrome exception",
+    selector: "#error-information-popup-container",
+    async handler(page: puppeteer.Page): Promise<void> {
+      debug("Chrome exception");
+      const errorMessage =
+        (await page.evaluate(
+          // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+          // @ts-ignore
+          () => document.querySelector(".error-code").textContent
+        )) || "Unable to find `error-code` on page.";
+      debug(errorMessage);
+
+      const path = "aws-azure-login-unrecognized-chrome-exception.png";
+
+      let descriptiveError: string;
+      switch (errorMessage) {
+        case "HTTP ERROR 401":
+          descriptiveError =
+            "Failed to authenticate. Invalid username/password combination.";
+          break;
+        case "Unable to find `error-code` on page.":
+          await page.screenshot({ path });
+          throw new CLIError(
+            `Unable to recognize Puppeteer's page state!
+  * A screenshot has been dumped to '${path}'
+  * If the screenshot is blank, try running with '--mode=debug'
+  * If this problem persists, try running with '--mode=gui'
+  * If your organisation uses ADFS, please read the 'ADFS' section in the README`
+          );
+        default:
+          descriptiveError = "Unable to find the error on the page.";
+      }
+
+      throw new CLIError(descriptiveError);
+    },
+  },
 ];
 
 export const login = {
@@ -424,10 +502,12 @@ export const login = {
       noPrompt,
       enableChromeNetworkService,
       profile.azure_default_username,
-      profile.azure_default_password,
+      profile.azure_default_password as string,
       enableChromeSeamlessSso,
       profile.azure_default_remember_me,
-      noDisableExtensions
+      noDisableExtensions,
+      profile.adfs_prompt_expected as boolean,
+      profile.adfs_username as string
     );
     const roles = this._parseRolesFromSamlResponse(samlResponse);
     const { role, durationHours } = await this._askUserForRoleAndDurationAsync(
@@ -556,6 +636,7 @@ export const login = {
     debug("Generating UUID for SAML request");
     const id = v4();
 
+    // noinspection CheckTagEmptyBody
     const samlRequest = `
         <samlp:AuthnRequest xmlns="urn:oasis:names:tc:SAML:2.0:metadata" ID="id${id}" Version="2.0" IssueInstant="${new Date().toISOString()}" IsPassive="false" AssertionConsumerServiceURL="${assertionConsumerServiceURL}" xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol">
             <Issuer xmlns="urn:oasis:names:tc:SAML:2.0:assertion">${appIdUri}</Issuer>
@@ -598,6 +679,8 @@ export const login = {
    * @param {bool} [enableChromeSeamlessSso] - chrome seamless SSO
    * @param {bool} [rememberMe] - Enable remembering the session
    * @param {bool} [noDisableExtensions] - True to prevent Puppeteer from disabling Chromium extensions
+   * @param {bool} [adfsPromptExpected] - True to support an expected ADFS basic Auth prompt
+   * @param {string} [adfsUsername] - The username to use for ADFS basic Auth prompt
    * @returns {Promise.<string>} The SAML response.
    * @private
    */
@@ -609,14 +692,20 @@ export const login = {
     noPrompt: boolean,
     enableChromeNetworkService: boolean,
     defaultUsername: string,
-    defaultPassword: string | undefined,
+    defaultPassword: string,
     enableChromeSeamlessSso: boolean,
     rememberMe: boolean,
-    noDisableExtensions: boolean
+    noDisableExtensions: boolean,
+    adfsPromptExpected: boolean,
+    adfsUsername: string
   ): Promise<string> {
     debug("Loading login page in Chrome");
 
     let browser: puppeteer.Browser | undefined;
+
+    // Export locally
+    ADFS_PROMPT_EXPECTED = adfsPromptExpected;
+    ADFS_USERNAME = adfsUsername;
 
     try {
       const args = headless
@@ -704,7 +793,7 @@ export const login = {
         if (err instanceof Error) {
           // An error will be thrown if you're still logged in cause the page.goto ot waitForNavigation
           // will be a redirect to AWS. That's usually OK
-          debug(`Error occured during loading the first page: ${err.message}`);
+          debug(`Error occurred during loading the first page: ${err.message}`);
         }
       }
 
@@ -752,6 +841,32 @@ export const login = {
 
               debug(`Finished state: ${state.name}`);
 
+              // If `username input` state was successful, check if an ADFS authentication prompt is expected.
+              if (state.name == "username input") {
+                debug(
+                  "Checking if user is expecting an ADFS authentication prompt..."
+                );
+                if (ADFS_PROMPT_EXPECTED) {
+                  debug("Expecting ADFS authentication prompt.");
+
+                  // Switch ADFS Basic Auth username if user has ADFS_USERNAME set in their AWS Profile.
+                  let username: string;
+                  if (typeof ADFS_USERNAME === null) {
+                    username = ADFS_USERNAME;
+                  } else {
+                    username = USERNAME;
+                  }
+
+                  await page.authenticate({
+                    username: username,
+                    password: PASSWORD,
+                  });
+                }
+              } else {
+                debug(
+                  "Skipping ADFS authentication support: not configured in AWS config."
+                );
+              }
               break;
             }
           }
@@ -764,7 +879,12 @@ export const login = {
               const path = "aws-azure-login-unrecognized-state.png";
               await page.screenshot({ path });
               throw new CLIError(
-                `Unable to recognize page state! A screenshot has been dumped to ${path}. If this problem persists, try running with --mode=gui or --mode=debug`
+                `Unable to recognize Puppeteer's page state!
+  * A screenshot has been dumped to '${path}'
+  * If the screenshot is blank, try running with '--mode=debug'
+  * If this problem persists, try running with '--mode=gui'
+  * If your organisation uses ADFS, please read the 'ADFS' section in the README
+  `
               );
             }
 
